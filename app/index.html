@@ -78,9 +78,23 @@ function parseCSV(text) {
 function markDirty(v = true) { dirty = v; $("status").textContent = v ? "Unsaved changes" : ""; }
 window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
 
+// A day holds {skipped, rows: [{hours, description}]}. Files saved before
+// multiple rows existed have {hours, description, skipped}; they become one row.
+function dayEntry(date) {
+  const e = entries[date] || (entries[date] = { skipped: false });
+  if (!e.rows) {
+    e.rows = [{ hours: e.hours ?? "", description: e.description ?? "" }];
+    delete e.hours; delete e.description;
+  }
+  return e;
+}
+
 function totals() {
   let h = 0;
-  for (const e of Object.values(entries)) if (!e.skipped) h += Number(e.hours) || 0;
+  for (const d of Object.keys(entries)) {
+    const e = dayEntry(d);
+    if (!e.skipped) for (const r of e.rows) h += Number(r.hours) || 0;
+  }
   const rate = Number($("rate").value) || 0;
   $("total").textContent = `${h.toFixed(2)} hours` + (rate ? ` · $${(h * rate).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : "");
 }
@@ -105,13 +119,13 @@ function render() {
 
   for (const date of [...byDay.keys()].sort()) {
     const msgs = byDay.get(date);
-    const e = entries[date] || (entries[date] = { hours: "", description: "", skipped: false });
+    const e = dayEntry(date);
     const sent = msgs.filter(m => m.direction === "sent").length;
     const dow = new Date(date + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
     const card = el("section", { className: "day" });
     const refresh = () => {
       card.classList.toggle("skipped", e.skipped);
-      card.classList.toggle("done", !e.skipped && Number(e.hours) > 0);
+      card.classList.toggle("done", !e.skipped && e.rows.some(r => Number(r.hours) > 0));
     };
 
     card.append(el("h2", {}, dow, el("small", { textContent: `${sent} sent · ${msgs.length - sent} received`, style: "font-weight:400;color:#666" })));
@@ -142,18 +156,30 @@ function render() {
     }
     card.append(ul);
 
-    const hours = el("input", { type: "number", min: 0, step: 0.25, value: e.hours, placeholder: "hrs", title: "Hours, in quarter hours" });
-    hours.addEventListener("input", () => { e.hours = hours.value; refresh(); totals(); markDirty(); });
-    hours.addEventListener("change", () => {            // snap to the nearest quarter hour
-      if (hours.value !== "") { e.hours = hours.value = (Math.round(Number(hours.value) * 4) / 4).toString(); totals(); }
-    });
-    const desc = el("textarea", { value: e.description, placeholder: "Description of work" });
-    desc.addEventListener("input", () => { e.description = desc.value; markDirty(); });
+    const rowsBox = el("div");
+    const drawRows = () => {
+      rowsBox.replaceChildren();
+      e.rows.forEach((r, i) => {
+        const hours = el("input", { type: "number", min: 0, step: 0.25, value: r.hours, placeholder: "hrs", title: "Hours, in quarter hours" });
+        hours.addEventListener("input", () => { r.hours = hours.value; refresh(); totals(); markDirty(); });
+        hours.addEventListener("change", () => {          // snap to the nearest quarter hour
+          if (hours.value !== "") { r.hours = hours.value = (Math.round(Number(hours.value) * 4) / 4).toString(); totals(); }
+        });
+        const desc = el("textarea", { value: r.description, placeholder: "Description of work" });
+        desc.addEventListener("input", () => { r.description = desc.value; markDirty(); });
+        const remove = el("button", { textContent: "✕", title: "Remove this entry", hidden: e.rows.length < 2 });
+        remove.addEventListener("click", () => { e.rows.splice(i, 1); drawRows(); totals(); markDirty(); });
+        rowsBox.append(el("div", { className: "entry" }, hours, desc, remove));
+      });
+      refresh();
+    };
+    const add = el("button", { textContent: "+ Add entry" });
+    add.addEventListener("click", () => { e.rows.push({ hours: "", description: "" }); drawRows(); markDirty(); });
     const skip = el("input", { type: "checkbox", checked: e.skipped });
     skip.addEventListener("change", () => { e.skipped = skip.checked; refresh(); totals(); markDirty(); });
 
-    card.append(el("div", { className: "entry" }, hours, desc, el("label", {}, skip, "not billable")));
-    refresh();
+    card.append(rowsBox, el("div", { className: "entry", style: "margin-top:.4rem" }, add, el("label", {}, skip, "not billable")));
+    drawRows();
     root.append(card);
   }
   totals();
@@ -216,8 +242,9 @@ $("export").addEventListener("click", () => {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const lines = ["date,hours,description"];
   for (const d of Object.keys(entries).sort()) {
-    const e = entries[d];
-    if (!e.skipped && Number(e.hours) > 0) lines.push([d, e.hours, q(e.description)].join(","));
+    const e = dayEntry(d);
+    if (e.skipped) continue;
+    for (const r of e.rows) if (Number(r.hours) > 0) lines.push([d, r.hours, q(r.description)].join(","));
   }
   download("time-entries.csv", "text/csv", lines.join("\n"));
 });
