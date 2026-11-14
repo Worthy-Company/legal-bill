@@ -31,18 +31,33 @@
 </head>
 <body>
 <header>
-  <label>Messages file <input type="file" id="csvFile" accept=".json,.csv"></label>
+  <button id="pickMsgs">Choose messages file…</button>
+  <button id="reopenMsgs" hidden></button>
+  <label id="msgsFallback">Messages file <input type="file" id="csvFile" accept=".json,.csv"></label>
   <label>From <input type="date" id="start" value="2026-06-22"></label>
   <label>To <input type="date" id="end"></label>
   <label title="0 is the first Google account signed in to this browser; use his email address if Gmail opens the wrong account">Gmail account <input type="text" id="account" value="0" style="width:9rem"></label>
   <label>Rate $/hr <input type="number" id="rate" min="0" step="1" style="width:5rem"></label>
   <span class="total" id="total"></span>
 </header>
+<details id="storage" style="margin:.6rem 0">
+  <summary>Where entries are saved (GitHub)</summary>
+  <div class="bar" style="margin:.5rem 0">
+    <label>Repository <input type="text" id="repo" value="anthonylawoffice/client-data" style="width:15rem"></label>
+    <label>Client folder <input type="text" id="folder" value="fl1capital" style="width:8rem"></label>
+    <label>Invoice <input type="text" id="invoice" value="2026-06-22" style="width:8rem"></label>
+    <label title="A fine-grained token limited to this one repository, with Contents read and write. Kept in this browser until the expiry date.">Token <input type="password" id="token" autocomplete="off" style="width:12rem"></label>
+    <label title="The expiry date you chose when making the token. The page forgets it then. Blank means 30 days.">Token expires <input type="date" id="tokenExp"></label>
+    <button id="forgetToken">Forget token</button>
+  </div>
+</details>
 <div class="bar" style="margin:.6rem 0">
-  <button id="save">Save entries</button>
-  <button id="open">Open entries…</button>
-  <label>Open entries <input type="file" id="jsonFile" accept=".json"></label>
+  <button id="save">Save</button>
+  <button id="load">Load saved</button>
+  <button id="wp" title="Copies the time entries as a table. Paste it into the invoice in WordPerfect.">Copy for WordPerfect</button>
   <button id="export">Export CSV</button>
+  <button id="copy">Download a copy</button>
+  <label>Import old file <input type="file" id="jsonFile" accept=".json"></label>
   <span id="status" style="color:#666"></span>
 </div>
 <div id="days"><p id="empty">Choose the messages file to begin.</p></div>
@@ -190,54 +205,189 @@ function download(name, type, text) {
   a.click(); URL.revokeObjectURL(a.href);
 }
 
-$("csvFile").addEventListener("change", async (ev) => {
-  const f = ev.target.files[0]; if (!f) return;
-  const t = await f.text();
-  messages = f.name.endsWith(".json") ? JSON.parse(t) : parseCSV(t);
-  render();
-});
-// Chrome and Edge can keep a handle to the entries file, so after the first
-// choice every Save writes back to the same file in the folder he picked.
-// Other browsers fall back to an ordinary download.
-const canPick = "showSaveFilePicker" in window;
-const jsonTypes = [{ description: "Entries", accept: { "application/json": [".json"] } }];
-let entriesHandle = null;
+const say = (s) => { $("status").textContent = s; };
 
-function loadEntries(text) {
-  try {
-    const data = JSON.parse(text);
-    entries = data.entries || {};
-    if (data.rate) $("rate").value = data.rate;
-    markDirty(false); render();
-  } catch { alert("That file isn't a saved entries file."); }
+// ---- Messages file: remembered across refreshes -------------------------
+// Chrome and Edge let a page keep a *pointer* to a file the user chose. We
+// store only that pointer (in this browser), never the email text itself.
+const canPickOpen = "showOpenFilePicker" in window;
+const kv = (mode, fn) => new Promise((res, rej) => {
+  const open = indexedDB.open("legal-bill", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("kv");
+  open.onerror = () => rej(open.error);
+  open.onsuccess = () => {
+    const tx = open.result.transaction("kv", mode);
+    const r = fn(tx.objectStore("kv"));
+    tx.oncomplete = () => res(r.result);
+    tx.onerror = () => rej(tx.error);
+  };
+});
+
+async function loadMessagesText(name, text) {
+  messages = name.endsWith(".json") ? JSON.parse(text) : parseCSV(text);
+  render();
+}
+async function loadMessagesHandle(h) {
+  await loadMessagesText(h.name, await (await h.getFile()).text());
+  $("reopenMsgs").hidden = true;
 }
 
-if (canPick) $("jsonFile").closest("label").hidden = true;
-else $("open").hidden = true;
+if (canPickOpen) {
+  $("msgsFallback").hidden = true;
+  $("pickMsgs").addEventListener("click", async () => {
+    try {
+      const [h] = await showOpenFilePicker({ types: [{ description: "Messages", accept: { "application/json": [".json"], "text/csv": [".csv"] } }] });
+      await kv("readwrite", (s) => s.put(h, "messagesHandle"));
+      await loadMessagesHandle(h);
+    } catch (e) { if (e.name !== "AbortError") alert(e.message); }
+  });
+  // On page load: reuse last time's file if the browser still allows it,
+  // otherwise offer a one-click button (the browser needs a click to re-allow).
+  kv("readonly", (s) => s.get("messagesHandle")).then(async (h) => {
+    if (!h) return;
+    try {
+      if (await h.queryPermission({ mode: "read" }) === "granted") return loadMessagesHandle(h);
+    } catch { return; }
+    const b = $("reopenMsgs");
+    b.textContent = `Reopen ${h.name}`; b.hidden = false;
+    b.onclick = async () => {
+      try { if (await h.requestPermission({ mode: "read" }) === "granted") await loadMessagesHandle(h); }
+      catch (e) { alert(e.message); }
+    };
+  }).catch(() => {});
+} else {
+  $("pickMsgs").hidden = true;
+}
+$("csvFile").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0]; if (f) loadMessagesText(f.name, await f.text());
+});
 
-$("open").addEventListener("click", async () => {
+// ---- Entries: saved to the client-data repo through the GitHub API -------
+const settingIds = ["repo", "folder", "invoice"];
+for (const id of settingIds) {
+  const v = localStorage.getItem("setting." + id);
+  if (v) $(id).value = v;
+  $(id).addEventListener("input", () => { localStorage.setItem("setting." + id, $(id).value); sha = null; });
+}
+// The token stays in this browser until its expiry date, then is forgotten.
+// Anything that can read this page's storage (such as a malicious extension)
+// could read it, so it should be a token limited to the one repository.
+function storeToken() {
+  const token = $("token").value.trim();
+  if (!token) { localStorage.removeItem("token"); return; }
+  if (!$("tokenExp").value) $("tokenExp").value = new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10);
+  localStorage.setItem("token", JSON.stringify({ token, expires: $("tokenExp").value }));
+}
+try {
+  const saved = JSON.parse(localStorage.getItem("token") || "null");
+  if (saved && saved.expires >= new Date().toISOString().slice(0, 10)) {
+    $("token").value = saved.token; $("tokenExp").value = saved.expires;
+  } else if (saved) { localStorage.removeItem("token"); say("The saved token expired. Paste a new one."); }
+} catch { localStorage.removeItem("token"); }
+$("token").addEventListener("input", storeToken);
+$("tokenExp").addEventListener("change", storeToken);
+$("forgetToken").addEventListener("click", () => { localStorage.removeItem("token"); $("token").value = ""; $("tokenExp").value = ""; say("Token forgotten."); });
+
+let sha = null;   // version of the saved file we last saw; GitHub refuses a save over a newer one
+
+function target() {
+  const clean = (s) => s.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^\.+/, "");
+  const repo = $("repo").value.trim(), folder = clean($("folder").value), invoice = clean($("invoice").value);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("Repository should look like owner/name.");
+  if (!folder || !invoice) throw new Error("Fill in the client folder and the invoice name.");
+  if (!$("token").value.trim()) throw new Error("Paste the GitHub token first (Where entries are saved).");
+  return { url: `https://api.github.com/repos/${repo}/contents/${folder}/invoices/${invoice}.json`, label: `${folder}/invoices/${invoice}.json` };
+}
+const gh = (url, opts = {}) => fetch(url, { ...opts, headers: {
+  Authorization: `Bearer ${$("token").value.trim()}`, Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28", ...(opts.headers || {}) } });
+const toB64 = (s) => { let b = ""; for (const x of new TextEncoder().encode(s)) b += String.fromCharCode(x); return btoa(b); };
+const fromB64 = (s) => new TextDecoder().decode(Uint8Array.from(atob(s), (c) => c.charCodeAt(0)));
+const ghError = async (r) => `GitHub said ${r.status}: ${(await r.json().catch(() => ({}))).message || r.statusText}`;
+
+function applyEntries(data) {
+  entries = data.entries || {};
+  if (data.rate) $("rate").value = data.rate;
+  markDirty(false); render();
+}
+
+async function loadSaved() {
   try {
-    [entriesHandle] = await showOpenFilePicker({ types: jsonTypes });
-    loadEntries(await (await entriesHandle.getFile()).text());
-  } catch (e) { if (e.name !== "AbortError") alert(e.message); }
-});
+    const t = target();
+    say("Loading…");
+    const r = await gh(t.url);
+    if (r.status === 404) { sha = null; say(`Nothing saved yet at ${t.label}`); return; }
+    if (!r.ok) throw new Error(await ghError(r));
+    const f = await r.json();
+    sha = f.sha;
+    applyEntries(JSON.parse(fromB64(f.content)));
+    say(`Loaded ${t.label}`);
+  } catch (e) { say(""); alert(e.message); }
+}
+
+async function saveEntries() {
+  try {
+    const t = target();
+    say("Saving…");
+    const body = { message: `Update time entries (${t.label})`, content: toB64(JSON.stringify({ rate: $("rate").value, entries }, null, 2)) };
+    if (sha) body.sha = sha;
+    const r = await gh(t.url, { method: "PUT", body: JSON.stringify(body) });
+    if (r.status === 409 || r.status === 422) throw new Error("The saved copy changed since you loaded it (or it already exists). Click “Load saved” first, then make your changes again.");
+    if (!r.ok) throw new Error(await ghError(r));
+    sha = (await r.json()).content.sha;
+    markDirty(false);
+    say(`Saved ${new Date().toLocaleTimeString()} to ${t.label}`);
+  } catch (e) { say(""); alert(e.message); }
+}
+
+$("save").addEventListener("click", saveEntries);
+$("load").addEventListener("click", () => { if (!dirty || confirm("Discard unsaved changes and load the saved copy?")) loadSaved(); });
+$("copy").addEventListener("click", () => download("entries.json", "application/json", JSON.stringify({ rate: $("rate").value, entries }, null, 2)));
 $("jsonFile").addEventListener("change", async (ev) => {
-  const f = ev.target.files[0]; if (f) loadEntries(await f.text());
+  const f = ev.target.files[0]; if (!f) return;
+  try { applyEntries(JSON.parse(await f.text())); markDirty(true); } catch { alert("That file isn't a saved entries file."); }
 });
+if ($("token").value) loadSaved();            // refreshing the page picks up where he left off
 
 for (const id of ["start", "end"]) $(id).addEventListener("change", render);
 $("rate").addEventListener("input", totals);
-$("save").addEventListener("click", async () => {
-  const text = JSON.stringify({ rate: $("rate").value, entries }, null, 2);
-  if (!canPick) { download("entries.json", "application/json", text); markDirty(false); return; }
-  try {
-    entriesHandle ||= await showSaveFilePicker({ suggestedName: "entries.json", types: jsonTypes });
-    const w = await entriesHandle.createWritable();
-    await w.write(text); await w.close();
-    markDirty(false);
-    $("status").textContent = `Saved ${new Date().toLocaleTimeString()} to ${entriesHandle.name}`;
-  } catch (e) { if (e.name !== "AbortError") alert(e.message); }
+// Builds the table off-screen, selects it, and copies. That puts both a rich
+// table and tab-separated plain text on the clipboard, which word processors
+// (WordPerfect included) accept as a paste.
+$("wp").addEventListener("click", () => {
+  const rate = Number($("rate").value) || 0;
+  const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const us = (iso) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}/${iso.slice(0, 4)}`;
+  const start = $("start").value, end = $("end").value;
+  const head = ["Date", "Description", "Hours", ...(rate ? ["Amount"] : [])];
+  const body = []; let total = 0;
+  for (const d of Object.keys(entries).sort()) {
+    if ((start && d < start) || (end && d > end)) continue;
+    const e = dayEntry(d);
+    if (e.skipped) continue;
+    for (const r of e.rows) {
+      const h = Number(r.hours) || 0;
+      if (h <= 0) continue;
+      total += h;
+      body.push([us(d), r.description.replace(/\s*\n\s*/g, " ").trim(), h.toFixed(2), ...(rate ? [money(h * rate)] : [])]);
+    }
+  }
+  if (!body.length) { alert("No billable entries in this date range yet."); return; }
+  body.push(["", "Total", total.toFixed(2), ...(rate ? [money(total * rate)] : [])]);
+
+  const table = el("table", { style: "border-collapse:collapse" });
+  const addRow = (cells, tag) => table.append(el("tr", {}, ...cells.map((c, i) =>
+    el(tag, { textContent: c, style: `border:1px solid #000;padding:2px 6px;vertical-align:top;${i >= 2 ? "text-align:right;" : ""}` }))));
+  addRow(head, "th"); body.forEach((r) => addRow(r, "td"));
+  const holder = el("div", { style: "position:fixed;left:-9999px;top:0" }, table);
+  document.body.append(holder);
+  const sel = getSelection(); sel.removeAllRanges();
+  const range = document.createRange(); range.selectNodeContents(table); sel.addRange(range);
+  const ok = document.execCommand("copy");
+  sel.removeAllRanges(); holder.remove();
+  say(ok ? `Copied ${body.length - 1} entries, ${total.toFixed(2)} hours. Paste into WordPerfect.` : "Copy was blocked by the browser.");
 });
+
 $("export").addEventListener("click", () => {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const lines = ["date,hours,description"];
