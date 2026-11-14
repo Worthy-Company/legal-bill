@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time entries</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; max-width: 60rem; margin: 1rem auto; padding: 0 1rem; color: #222; }
+  header, .bar { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: center; }
+  header { position: sticky; top: 0; background: #fff; padding: .5rem 0; border-bottom: 1px solid #ccc; }
+  label { display: inline-flex; gap: .4rem; align-items: center; }
+  .total { margin-left: auto; font-weight: 600; }
+  .day { border: 1px solid #ccc; border-radius: 6px; margin: .75rem 0; padding: .6rem .8rem; }
+  .day.done { background: #f1f8f1; border-color: #9c9; }
+  .day.skipped { opacity: .55; }
+  .day h2 { font-size: 1rem; margin: 0 0 .4rem; display: flex; gap: 1rem; align-items: baseline; }
+  .msgs { margin: 0 0 .6rem; padding: 0; list-style: none; font-size: 13px; }
+  .msgs li { display: grid; grid-template-columns: 3rem 5rem 14rem 1fr; gap: .5rem; padding: 1px 0; }
+  .msgs .who, .msgs .subj { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .msgs li { cursor: pointer; }
+  .msgs li:hover { background: #f5f5f5; }
+  .msgs .read { display: none; grid-column: 1 / -1; background: #fff; border: 1px solid #ddd; border-radius: 4px; padding: .5rem .7rem; margin: 2px 0 6px; cursor: text; white-space: pre-wrap; font-size: 13px; max-height: 24rem; overflow: auto; }
+  .msgs .read .hdr { color: #666; margin-bottom: .4rem; }
+  .msgs li.open .read { display: block; }
+  .entry { display: flex; gap: .6rem; align-items: flex-start; }
+  .entry textarea { flex: 1; min-height: 2.6rem; font: inherit; }
+  .entry input[type=number] { width: 5rem; font: inherit; }
+  button { font: inherit; padding: .3rem .7rem; }
+  #empty { color: #666; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<header>
+  <label>Messages file <input type="file" id="csvFile" accept=".json,.csv"></label>
+  <label>From <input type="date" id="start" value="2026-06-22"></label>
+  <label>To <input type="date" id="end"></label>
+  <label title="0 is the first Google account signed in to this browser; use his email address if Gmail opens the wrong account">Gmail account <input type="text" id="account" value="0" style="width:9rem"></label>
+  <label>Rate $/hr <input type="number" id="rate" min="0" step="1" style="width:5rem"></label>
+  <span class="total" id="total"></span>
+</header>
+<div class="bar" style="margin:.6rem 0">
+  <button id="save">Save entries</button>
+  <button id="open">Open entries…</button>
+  <label>Open entries <input type="file" id="jsonFile" accept=".json"></label>
+  <button id="export">Export CSV</button>
+  <span id="status" style="color:#666"></span>
+</div>
+<div id="days"><p id="empty">Choose the messages file to begin.</p></div>
+
+<script>
+"use strict";
+// Everything stays in this page. Nothing is uploaded.
+let messages = [];          // [{date,time,direction,from,to,cc,subject}]
+let entries = {};           // {"2026-07-01": {hours, description, skipped}}
+let dirty = false;
+
+const $ = (id) => document.getElementById(id);
+
+function parseCSV(text) {
+  const rows = []; let row = [], field = "", q = false;
+  text = text.replace(/^﻿/, "");
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  const head = rows.shift();
+  return rows.filter(r => r.length === head.length)
+    .map(r => Object.fromEntries(head.map((h, i) => [h, r[i]])));
+}
+
+function markDirty(v = true) { dirty = v; $("status").textContent = v ? "Unsaved changes" : ""; }
+window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+function totals() {
+  let h = 0;
+  for (const e of Object.values(entries)) if (!e.skipped) h += Number(e.hours) || 0;
+  const rate = Number($("rate").value) || 0;
+  $("total").textContent = `${h.toFixed(2)} hours` + (rate ? ` · $${(h * rate).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : "");
+}
+
+function el(tag, props = {}, ...kids) {
+  const n = Object.assign(document.createElement(tag), props);
+  n.append(...kids);
+  return n;
+}
+
+function render() {
+  const start = $("start").value, end = $("end").value;
+  const byDay = new Map();
+  for (const m of messages) {
+    if ((start && m.date < start) || (end && m.date > end)) continue;
+    if (!byDay.has(m.date)) byDay.set(m.date, []);
+    byDay.get(m.date).push(m);
+  }
+  const root = $("days");
+  root.replaceChildren();
+  if (!byDay.size) { root.append(el("p", { id: "empty", textContent: messages.length ? "No messages in that range." : "Choose the messages file to begin." })); totals(); return; }
+
+  for (const date of [...byDay.keys()].sort()) {
+    const msgs = byDay.get(date);
+    const e = entries[date] || (entries[date] = { hours: "", description: "", skipped: false });
+    const sent = msgs.filter(m => m.direction === "sent").length;
+    const dow = new Date(date + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    const card = el("section", { className: "day" });
+    const refresh = () => {
+      card.classList.toggle("skipped", e.skipped);
+      card.classList.toggle("done", !e.skipped && Number(e.hours) > 0);
+    };
+
+    card.append(el("h2", {}, dow, el("small", { textContent: `${sent} sent · ${msgs.length - sent} received`, style: "font-weight:400;color:#666" })));
+    const ul = el("ul", { className: "msgs" });
+    for (const m of msgs) {
+      const other = m.direction === "sent" ? m.to : m.from;
+      const files = m.attachments && m.attachments.length ? ` 📎${m.attachments.length}` : "";
+      const li = el("li", {},
+        el("span", { textContent: m.time }),
+        el("span", { textContent: m.direction === "sent" ? "sent to" : "from" }),
+        el("span", { className: "who", textContent: other, title: other }),
+        el("span", { className: "subj", textContent: m.subject + files, title: m.subject }));
+      const gmail = m.messageId ? el("a", {
+        textContent: "Open in Gmail", target: "_blank", rel: "noopener",
+      }) : "";
+      if (gmail) {
+        // Build the address when clicked, so a changed "Gmail account" applies at once.
+        const setHref = () => { gmail.href = `https://mail.google.com/mail/u/${encodeURIComponent($("account").value.trim() || "0")}/#search/${encodeURIComponent("rfc822msgid:" + m.messageId)}`; };
+        setHref();
+        gmail.addEventListener("click", (e) => { e.stopPropagation(); setHref(); });
+      }
+      li.append(el("div", { className: "read" }, ...(m.body === undefined ? [] : [
+        el("div", { className: "hdr" }, `From: ${m.from}\nTo: ${m.to}${m.cc ? "\nCc: " + m.cc : ""}\n`, gmail),
+        ...(files ? [el("div", { textContent: "Attachments: " + m.attachments.join(", "), className: "hdr" })] : []),
+        el("div", { textContent: m.body })])));
+      li.addEventListener("click", () => li.classList.toggle("open"));
+      ul.append(li);
+    }
+    card.append(ul);
+
+    const hours = el("input", { type: "number", min: 0, step: 0.25, value: e.hours, placeholder: "hrs", title: "Hours, in quarter hours" });
+    hours.addEventListener("input", () => { e.hours = hours.value; refresh(); totals(); markDirty(); });
+    hours.addEventListener("change", () => {            // snap to the nearest quarter hour
+      if (hours.value !== "") { e.hours = hours.value = (Math.round(Number(hours.value) * 4) / 4).toString(); totals(); }
+    });
+    const desc = el("textarea", { value: e.description, placeholder: "Description of work" });
+    desc.addEventListener("input", () => { e.description = desc.value; markDirty(); });
+    const skip = el("input", { type: "checkbox", checked: e.skipped });
+    skip.addEventListener("change", () => { e.skipped = skip.checked; refresh(); totals(); markDirty(); });
+
+    card.append(el("div", { className: "entry" }, hours, desc, el("label", {}, skip, "not billable")));
+    refresh();
+    root.append(card);
+  }
+  totals();
+}
+
+function download(name, type, text) {
+  const a = el("a", { href: URL.createObjectURL(new Blob([text], { type })), download: name });
+  a.click(); URL.revokeObjectURL(a.href);
+}
+
+$("csvFile").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0]; if (!f) return;
+  const t = await f.text();
+  messages = f.name.endsWith(".json") ? JSON.parse(t) : parseCSV(t);
+  render();
+});
+// Chrome and Edge can keep a handle to the entries file, so after the first
+// choice every Save writes back to the same file in the folder he picked.
+// Other browsers fall back to an ordinary download.
+const canPick = "showSaveFilePicker" in window;
+const jsonTypes = [{ description: "Entries", accept: { "application/json": [".json"] } }];
+let entriesHandle = null;
+
+function loadEntries(text) {
+  try {
+    const data = JSON.parse(text);
+    entries = data.entries || {};
+    if (data.rate) $("rate").value = data.rate;
+    markDirty(false); render();
+  } catch { alert("That file isn't a saved entries file."); }
+}
+
+if (canPick) $("jsonFile").closest("label").hidden = true;
+else $("open").hidden = true;
+
+$("open").addEventListener("click", async () => {
+  try {
+    [entriesHandle] = await showOpenFilePicker({ types: jsonTypes });
+    loadEntries(await (await entriesHandle.getFile()).text());
+  } catch (e) { if (e.name !== "AbortError") alert(e.message); }
+});
+$("jsonFile").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0]; if (f) loadEntries(await f.text());
+});
+
+for (const id of ["start", "end"]) $(id).addEventListener("change", render);
+$("rate").addEventListener("input", totals);
+$("save").addEventListener("click", async () => {
+  const text = JSON.stringify({ rate: $("rate").value, entries }, null, 2);
+  if (!canPick) { download("entries.json", "application/json", text); markDirty(false); return; }
+  try {
+    entriesHandle ||= await showSaveFilePicker({ suggestedName: "entries.json", types: jsonTypes });
+    const w = await entriesHandle.createWritable();
+    await w.write(text); await w.close();
+    markDirty(false);
+    $("status").textContent = `Saved ${new Date().toLocaleTimeString()} to ${entriesHandle.name}`;
+  } catch (e) { if (e.name !== "AbortError") alert(e.message); }
+});
+$("export").addEventListener("click", () => {
+  const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  const lines = ["date,hours,description"];
+  for (const d of Object.keys(entries).sort()) {
+    const e = entries[d];
+    if (!e.skipped && Number(e.hours) > 0) lines.push([d, e.hours, q(e.description)].join(","));
+  }
+  download("time-entries.csv", "text/csv", lines.join("\n"));
+});
+</script>
+</body>
+</html>
