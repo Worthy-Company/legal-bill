@@ -27,6 +27,12 @@
   .entry input[type=number] { width: 5rem; font: inherit; }
   button { font: inherit; padding: .3rem .7rem; }
   #empty { color: #666; margin-top: 2rem; }
+  /* Keep the time entry in view while he reads a long message above it. */
+  .entrybox { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #ccc; padding-top: .4rem; z-index: 1; }
+  .day.done .entrybox { background: #f1f8f1; }
+  .msgs .read { max-height: 35vh; }
+  .entry textarea { min-height: 2.2rem; }
+  @media (max-height: 800px) { header { position: static; } }
 </style>
 </head>
 <body>
@@ -55,7 +61,8 @@
   <button id="save">Save</button>
   <button id="load">Load saved</button>
   <button id="wp" title="Copies the time entries as a table. Paste it into the invoice in WordPerfect.">Copy for WordPerfect</button>
-  <button id="rtf" title="Downloads a file with the entries as a table. Open it in WordPerfect, then copy the table into the invoice.">Download for WordPerfect (RTF)</button>
+  <button id="txt" title="Copies one line per entry, separated by tabs. Paste it into the invoice as ordinary text.">Copy as text</button>
+  <button id="rtf"title="Downloads a file with the entries as a table. Open it in WordPerfect, then copy the table into the invoice.">Download for WordPerfect (RTF)</button>
   <button id="export">Export CSV</button>
   <button id="copy">Download a copy</button>
   <label>Import old file <input type="file" id="jsonFile" accept=".json"></label>
@@ -194,7 +201,8 @@ function render() {
     const skip = el("input", { type: "checkbox", checked: e.skipped });
     skip.addEventListener("change", () => { e.skipped = skip.checked; refresh(); totals(); markDirty(); });
 
-    card.append(rowsBox, el("div", { className: "entry", style: "margin-top:.4rem" }, add, el("label", {}, skip, "not billable")));
+    card.append(el("div", { className: "entrybox" }, rowsBox,
+      el("div", { className: "entry", style: "margin-top:.4rem" }, add, el("label", {}, skip, "not billable"))));
     drawRows();
     root.append(card);
   }
@@ -397,6 +405,19 @@ $("rtf").addEventListener("click", () => {
   const rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times New Roman;}}\\f0\\fs24\n" + inv.body.map(row).join("") + "}";
   download("time-entries.rtf", "application/rtf", rtf);
   say(`RTF has ${inv.count} entries, ${inv.hours} hours. Open it in WordPerfect and copy the table into the invoice.`);
+});
+
+// Plain text, one line per entry: date <tab> description <tab> hours. It pastes
+// as ordinary text, so it takes on the tab stops of wherever it lands.
+$("txt").addEventListener("click", async () => {
+  const inv = invoiceLines(); if (!inv) return;
+  const text = inv.body.map((r) => r.join("\t")).join("\r\n");
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = el("textarea", { value: text, style: "position:fixed;left:-9999px" });
+    document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  say(`Copied ${inv.count} entries as text with tabs. Paste into the invoice.`);
 });
 
 $("wp").addEventListener("click", () => {
