@@ -33,6 +33,21 @@
   .msgs .read { max-height: 35vh; }
   .entry textarea { min-height: 2.2rem; }
   @media (max-height: 800px) { header { position: static; } }
+  #nav { display: flex; gap: .4rem; margin: .4rem 0; }
+  #nav button.on { background: #222; color: #fff; }
+  table.draft { border-collapse: collapse; width: 100%; }
+  table.draft td { padding: 3px 8px; vertical-align: top; border-bottom: 1px solid #eee; }
+  table.draft td.num { text-align: right; white-space: nowrap; }
+  table.draft tr.recent { background: #dff2df; }
+  table.draft tr.unsaved { background: #fff3c4; }
+  table.draft tr.deleted { background: #fbdcdc; text-decoration: line-through; color: #777; }
+  table.draft tr.total td { font-weight: 600; border-top: 2px solid #999; }
+  .chip { padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .chip.recent { background: #dff2df; } .chip.unsaved { background: #fff3c4; } .chip.deleted { background: #fbdcdc; }
+  .fu { display: flex; gap: .7rem; padding: .3rem 0; border-bottom: 1px solid #eee; align-items: baseline; }
+  .fu.done span { text-decoration: line-through; color: #888; }
+  .followup { display: flex; gap: .4rem; align-items: center; flex: 1; }
+  .followup input[type=text] { flex: 1; font: inherit; }
 </style>
 </head>
 <body>
@@ -62,13 +77,20 @@
   <button id="load">Load saved</button>
   <button id="wp" title="Copies the time entries as a table. Paste it into the invoice in WordPerfect.">Copy for WordPerfect</button>
   <button id="txt" title="Copies one line per entry, separated by tabs. Paste it into the invoice as ordinary text.">Copy as text</button>
-  <button id="rtf"title="Downloads a file with the entries as a table. Open it in WordPerfect, then copy the table into the invoice.">Download for WordPerfect (RTF)</button>
+  <button id="rtf" title="Downloads a file with the entries as a table. Open it in WordPerfect, then copy the table into the invoice.">Download for WordPerfect (RTF)</button>
   <button id="export">Export CSV</button>
   <button id="copy">Download a copy</button>
   <label>Import old file <input type="file" id="jsonFile" accept=".json"></label>
   <span id="status" style="color:#666"></span>
 </div>
+<div id="nav">
+  <button data-view="review" class="on">Review</button>
+  <button data-view="draft">Draft invoice</button>
+  <button data-view="followups">Follow-ups<span id="fuCount"></span></button>
+</div>
 <div id="days"><p id="empty">Choose the messages file to begin.</p></div>
+<div id="draft" hidden></div>
+<div id="followups" hidden></div>
 
 <script>
 "use strict";
@@ -98,17 +120,50 @@ function parseCSV(text) {
     .map(r => Object.fromEntries(head.map((h, i) => [h, r[i]])));
 }
 
-function markDirty(v = true) { dirty = v; $("status").textContent = v ? "Unsaved changes" : ""; }
+// Autosave: a few seconds after the last change, the entries are saved.
+// `rev` counts changes so a save can tell whether he typed while it was running.
+let rev = 0, saving = false, saveTimer = null;
+let snapshot = new Map();      // row key -> signature, as of the last save or load
+let recent = new Set();        // row keys that the latest save changed (shown green)
+
+function markDirty(v = true) {
+  dirty = v;
+  if (v) { rev++; scheduleSave(); }
+  $("status").textContent = v ? "Unsaved changes" : "";
+}
+const AUTOSAVE_MS = 15 * 60 * 1000;
+function scheduleSave() {
+  // The clock starts at the first unsaved change and is not restarted by later
+  // ones, so steady typing can't keep postponing the save.
+  if (saveTimer || !$("token").value.trim()) return;   // no token yet: he saves by hand
+  saveTimer = setTimeout(() => saveEntries({ auto: true }), AUTOSAVE_MS);
+}
+// Every time-entry row by id, with what it said, so a save can tell which rows
+// were added or edited and which were deleted.
+function rowSigs(ent) {
+  const m = new Map();
+  for (const d of Object.keys(ent)) {
+    const e = ent[d];
+    const rows = e.rows || [{ hours: e.hours ?? "", description: e.description ?? "" }];
+    rows.forEach((r, i) => m.set(r.id || `${d}#${i}`, {
+      date: d, hours: r.hours ?? "", description: r.description ?? "",
+      sig: `${e.skipped ? "x" : ""}|${r.hours ?? ""}|${r.description ?? ""}`,
+    }));
+  }
+  return m;
+}
 window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 // A day holds {skipped, rows: [{hours, description}]}. Files saved before
 // multiple rows existed have {hours, description, skipped}; they become one row.
+const uid = () => Math.random().toString(36).slice(2, 10);
 function dayEntry(date) {
   const e = entries[date] || (entries[date] = { skipped: false });
   if (!e.rows) {
     e.rows = [{ hours: e.hours ?? "", description: e.description ?? "" }];
     delete e.hours; delete e.description;
   }
+  for (const r of e.rows) r.id ||= uid();     // each entry keeps one id, so a deletion can be told from an edit
   return e;
 }
 
@@ -145,7 +200,7 @@ function render() {
     const e = dayEntry(date);
     const sent = msgs.filter(m => m.direction === "sent").length;
     const dow = new Date(date + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
-    const card = el("section", { className: "day" });
+    const card = el("section", { className: "day", id: "day-" + date });
     const refresh = () => {
       card.classList.toggle("skipped", e.skipped);
       card.classList.toggle("done", !e.skipped && e.rows.some(r => Number(r.hours) > 0));
@@ -197,12 +252,24 @@ function render() {
       refresh();
     };
     const add = el("button", { textContent: "+ Add entry" });
-    add.addEventListener("click", () => { e.rows.push({ hours: "", description: "" }); drawRows(); markDirty(); });
+    add.addEventListener("click", () => { e.rows.push({ id: uid(), hours: "", description: "" }); drawRows(); markDirty(); });
     const skip = el("input", { type: "checkbox", checked: e.skipped });
     skip.addEventListener("change", () => { e.skipped = skip.checked; refresh(); totals(); markDirty(); });
 
+    // A note to himself about this day. It never appears on the invoice.
+    const fuText = el("input", { type: "text", value: e.followUp?.text || "", placeholder: "Follow up (a note to self; never on the invoice)" });
+    const fuDone = el("input", { type: "checkbox", checked: !!e.followUp?.done });
+    const fuChanged = () => {
+      if (!fuText.value.trim() && !fuDone.checked) delete e.followUp;
+      else e.followUp = { text: fuText.value, done: fuDone.checked };
+      markDirty(); refreshViews();
+    };
+    fuText.addEventListener("input", fuChanged);
+    fuDone.addEventListener("change", fuChanged);
+
     card.append(el("div", { className: "entrybox" }, rowsBox,
-      el("div", { className: "entry", style: "margin-top:.4rem" }, add, el("label", {}, skip, "not billable"))));
+      el("div", { className: "entry", style: "margin-top:.4rem;align-items:center" }, add, el("label", {}, skip, "not billable"),
+        el("div", { className: "followup" }, fuText, el("label", {}, fuDone, "done")))));
     drawRows();
     root.append(card);
   }
@@ -317,7 +384,9 @@ const ghError = async (r) => `GitHub said ${r.status}: ${(await r.json().catch((
 function applyEntries(data) {
   entries = data.entries || {};
   if (data.rate) $("rate").value = data.rate;
-  markDirty(false); render();
+  for (const d of Object.keys(entries)) dayEntry(d);      // give every entry its id before taking the snapshot
+  snapshot = rowSigs(entries); recent = new Set();
+  markDirty(false); render(); refreshViews();
 }
 
 async function loadSaved() {
@@ -334,19 +403,35 @@ async function loadSaved() {
   } catch (e) { say(""); alert(e.message); }
 }
 
-async function saveEntries() {
+// Runs when he clicks Save and, with { auto: true }, a few seconds after he
+// stops typing. An automatic save that fails shows a message instead of a popup.
+// GitHub refuses a save over a newer copy, so autosave can't overwrite work
+// made elsewhere.
+async function saveEntries(opts = {}) {
+  clearTimeout(saveTimer); saveTimer = null;
+  if (saving) { scheduleSave(); return; }
+  saving = true;
+  const startRev = rev;
   try {
     const t = target();
     say("Saving…");
-    const body = { message: `Update time entries (${t.label})`, content: toB64(JSON.stringify({ rate: $("rate").value, entries }, null, 2)) };
+    const text = JSON.stringify({ rate: $("rate").value, entries }, null, 2);
+    const body = { message: `Update time entries (${t.label})`, content: toB64(text) };
     if (sha) body.sha = sha;
     const r = await gh(t.url, { method: "PUT", body: JSON.stringify(body) });
     if (r.status === 409 || r.status === 422) throw new Error("The saved copy changed since you loaded it (or it already exists). Click “Load saved” first, then make your changes again.");
     if (!r.ok) throw new Error(await ghError(r));
     sha = (await r.json()).content.sha;
-    markDirty(false);
+    const next = rowSigs(JSON.parse(text).entries);
+    recent = new Set([...next.keys()].filter((k) => !snapshot.has(k) || next.get(k).sig !== snapshot.get(k).sig));
+    snapshot = next;
+    if (rev === startRev) markDirty(false); else scheduleSave();   // typed during the save: save again
     say(`Saved ${new Date().toLocaleTimeString()} to ${t.label}`);
-  } catch (e) { say(""); alert(e.message); }
+    refreshViews();
+  } catch (e) {
+    if (opts.auto) say(`Couldn't save automatically: ${e.message}`);
+    else { say(""); alert(e.message); }
+  } finally { saving = false; }
 }
 
 $("save").addEventListener("click", saveEntries);
@@ -366,11 +451,12 @@ $("rate").addEventListener("input", totals);
 // The invoice lines as [date, description, hours] plus a total line, in his
 // style: dates M/D/YY, hours like .5 or 1.25, dollars only on the total line.
 // Shared by every "to WordPerfect" button.
+const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const us = (iso) => `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}/${iso.slice(2, 4)}`;
+const hrs = (h) => String(+h.toFixed(2)).replace(/^0\./, ".");
+
 function invoiceLines() {
   const rate = Number($("rate").value) || 0;
-  const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const us = (iso) => `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}/${iso.slice(2, 4)}`;
-  const hrs = (h) => String(+h.toFixed(2)).replace(/^0\./, ".");
   const start = $("start").value, end = $("end").value;
   const body = []; let total = 0;
   for (const d of Object.keys(entries).sort()) {
@@ -435,6 +521,80 @@ $("wp").addEventListener("click", () => {
   sel.removeAllRanges(); holder.remove();
   say(ok ? `Copied ${entryCount} entries, ${hours} hours. Paste into WordPerfect.` : "Copy was blocked by the browser.");
 });
+
+// ---- Views: review, draft invoice, follow-ups ---------------------------
+let view = "review";
+function show(v) {
+  view = v;
+  $("days").hidden = v !== "review";
+  $("draft").hidden = v !== "draft";
+  $("followups").hidden = v !== "followups";
+  for (const b of document.querySelectorAll("#nav button")) b.classList.toggle("on", b.dataset.view === v);
+  if (v === "review") render();
+  refreshViews();
+}
+function refreshViews() {
+  if (view === "draft") renderDraft();
+  if (view === "followups") renderFollowups();
+  const open = Object.values(entries).filter((e) => e.followUp && e.followUp.text && !e.followUp.done).length;
+  $("fuCount").textContent = open ? ` (${open})` : "";
+}
+for (const b of document.querySelectorAll("#nav button")) b.addEventListener("click", () => show(b.dataset.view));
+
+// The invoice as it will read, with each row marked by its save state:
+//   green  = added or changed by the latest save
+//   yellow = added or changed since the latest save (not saved yet)
+//   red    = deleted since the latest save (struck through, not counted)
+function renderDraft() {
+  const root = $("draft"); root.replaceChildren();
+  const current = rowSigs(entries);
+  const start = $("start").value, end = $("end").value, rate = Number($("rate").value) || 0;
+  root.append(el("p", {}, el("span", { className: "chip recent", textContent: "saved in the latest save" }), " ",
+    el("span", { className: "chip unsaved", textContent: "changed, not saved yet" }), " ",
+    el("span", { className: "chip deleted", textContent: "deleted, not saved yet" })));
+  const table = el("table", { className: "draft" });
+  const inRange = (d) => !((start && d < start) || (end && d > end));
+  const deleted = [...snapshot].filter(([id, s]) => !current.has(id) && inRange(s.date));
+  const days = [...new Set([...Object.keys(entries), ...deleted.map(([, s]) => s.date)])].filter(inRange).sort();
+  let total = 0, n = 0;
+  for (const d of days) {
+    const e = entries[d] && dayEntry(d);
+    if (e && !e.skipped) {
+      for (const r of e.rows) {
+        const h = Number(r.hours) || 0;
+        if (!(r.description || "").trim() && h <= 0) continue;
+        const s = snapshot.get(r.id);
+        total += h; n++;
+        table.append(el("tr", { className: !s || s.sig !== current.get(r.id).sig ? "unsaved" : recent.has(r.id) ? "recent" : "" },
+          el("td", { textContent: us(d) }), el("td", { textContent: r.description || "" }),
+          el("td", { className: "num", textContent: h > 0 ? hrs(h) : "no hours" })));
+      }
+    }
+    for (const [, s] of deleted.filter(([, x]) => x.date === d)) {
+      if (!s.description.trim() && !(Number(s.hours) > 0)) continue;
+      table.append(el("tr", { className: "deleted" }, el("td", { textContent: us(d) }),
+        el("td", { textContent: s.description }), el("td", { className: "num", textContent: hrs(Number(s.hours) || 0) })));
+    }
+  }
+  if (!n && !table.children.length) { root.append(el("p", { textContent: "No entries in this date range yet." })); return; }
+  table.append(el("tr", { className: "total" }, el("td"), el("td", { textContent: "total this invoice" }),
+    el("td", { className: "num", textContent: hrs(total) + (rate ? `  ${money(total * rate)}` : "") })));
+  root.append(table);
+}
+
+function renderFollowups() {
+  const root = $("followups"); root.replaceChildren();
+  const days = Object.keys(entries).sort().filter((d) => entries[d].followUp && entries[d].followUp.text);
+  if (!days.length) { root.append(el("p", { textContent: "No follow-ups yet. Add one next to any day in Review." })); return; }
+  for (const d of days) {
+    const f = entries[d].followUp;
+    const done = el("input", { type: "checkbox", checked: f.done });
+    done.addEventListener("change", () => { f.done = done.checked; markDirty(); refreshViews(); });
+    const go = el("a", { href: "#", textContent: us(d) });
+    go.addEventListener("click", (ev) => { ev.preventDefault(); show("review"); document.getElementById("day-" + d)?.scrollIntoView(); });
+    root.append(el("div", { className: "fu" + (f.done ? " done" : "") }, done, go, el("span", { textContent: f.text })));
+  }
+}
 
 $("export").addEventListener("click", () => {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
