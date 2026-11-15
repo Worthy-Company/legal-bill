@@ -55,6 +55,7 @@
   <button id="save">Save</button>
   <button id="load">Load saved</button>
   <button id="wp" title="Copies the time entries as a table. Paste it into the invoice in WordPerfect.">Copy for WordPerfect</button>
+  <button id="rtf" title="Downloads a file with the entries as a table. Open it in WordPerfect, then copy the table into the invoice.">Download for WordPerfect (RTF)</button>
   <button id="export">Export CSV</button>
   <button id="copy">Download a copy</button>
   <label>Import old file <input type="file" id="jsonFile" accept=".json"></label>
@@ -354,12 +355,15 @@ $("rate").addEventListener("input", totals);
 // Builds the table off-screen, selects it, and copies. That puts both a rich
 // table and tab-separated plain text on the clipboard, which word processors
 // (WordPerfect included) accept as a paste.
-$("wp").addEventListener("click", () => {
+// The invoice lines as [date, description, hours] plus a total line, in his
+// style: dates M/D/YY, hours like .5 or 1.25, dollars only on the total line.
+// Shared by every "to WordPerfect" button.
+function invoiceLines() {
   const rate = Number($("rate").value) || 0;
   const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const us = (iso) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}/${iso.slice(0, 4)}`;
+  const us = (iso) => `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}/${iso.slice(2, 4)}`;
+  const hrs = (h) => String(+h.toFixed(2)).replace(/^0\./, ".");
   const start = $("start").value, end = $("end").value;
-  const head = ["Date", "Description", "Hours", ...(rate ? ["Amount"] : [])];
   const body = []; let total = 0;
   for (const d of Object.keys(entries).sort()) {
     if ((start && d < start) || (end && d > end)) continue;
@@ -369,23 +373,46 @@ $("wp").addEventListener("click", () => {
       const h = Number(r.hours) || 0;
       if (h <= 0) continue;
       total += h;
-      body.push([us(d), r.description.replace(/\s*\n\s*/g, " ").trim(), h.toFixed(2), ...(rate ? [money(h * rate)] : [])]);
+      body.push([us(d), r.description.replace(/\s*\n\s*/g, " ").trim(), hrs(h)]);
     }
   }
-  if (!body.length) { alert("No billable entries in this date range yet."); return; }
-  body.push(["", "Total", total.toFixed(2), ...(rate ? [money(total * rate)] : [])]);
+  if (!body.length) { alert("No billable entries in this date range yet."); return null; }
+  const count = body.length;
+  body.push(["", "total this invoice", hrs(total) + (rate ? `   ${money(total * rate)}` : "")]);
+  return { body, count, hours: hrs(total) };
+}
 
+// RTF is a format WordPerfect imports well, tables included.
+$("rtf").addEventListener("click", () => {
+  const inv = invoiceLines(); if (!inv) return;
+  const esc = (s) => [...s].map((ch) => {
+    const c = ch.charCodeAt(0);
+    if (ch === "\\" || ch === "{" || ch === "}") return "\\" + ch;
+    return c > 126 ? `\\u${c > 32767 ? c - 65536 : c}?` : ch;
+  }).join("");
+  const widths = [1300, 6500, 1560];                 // twips: date, description, hours
+  const edges = widths.map((w, i) => widths.slice(0, i + 1).reduce((a, b) => a + b));
+  const row = (cells) => "\\trowd\\trgaph108\\trleft0" + edges.map((x) => `\\cellx${x}`).join("") +
+    cells.map((c, i) => `\\pard\\intbl${i === 2 ? "\\qr" : "\\ql"} ${esc(c)}\\cell`).join("") + "\\row\n";
+  const rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times New Roman;}}\\f0\\fs24\n" + inv.body.map(row).join("") + "}";
+  download("time-entries.rtf", "application/rtf", rtf);
+  say(`RTF has ${inv.count} entries, ${inv.hours} hours. Open it in WordPerfect and copy the table into the invoice.`);
+});
+
+$("wp").addEventListener("click", () => {
+  const inv = invoiceLines(); if (!inv) return;
+  const { body, count: entryCount, hours } = inv;
   const table = el("table", { style: "border-collapse:collapse" });
   const addRow = (cells, tag) => table.append(el("tr", {}, ...cells.map((c, i) =>
-    el(tag, { textContent: c, style: `border:1px solid #000;padding:2px 6px;vertical-align:top;${i >= 2 ? "text-align:right;" : ""}` }))));
-  addRow(head, "th"); body.forEach((r) => addRow(r, "td"));
+    el(tag, { textContent: c, style: `padding:2px 8px;vertical-align:top;${i === 2 ? "text-align:right;" : ""}` }))));
+  body.forEach((r) => addRow(r, "td"));
   const holder = el("div", { style: "position:fixed;left:-9999px;top:0" }, table);
   document.body.append(holder);
   const sel = getSelection(); sel.removeAllRanges();
   const range = document.createRange(); range.selectNodeContents(table); sel.addRange(range);
   const ok = document.execCommand("copy");
   sel.removeAllRanges(); holder.remove();
-  say(ok ? `Copied ${body.length - 1} entries, ${total.toFixed(2)} hours. Paste into WordPerfect.` : "Copy was blocked by the browser.");
+  say(ok ? `Copied ${entryCount} entries, ${hours} hours. Paste into WordPerfect.` : "Copy was blocked by the browser.");
 });
 
 $("export").addEventListener("click", () => {
